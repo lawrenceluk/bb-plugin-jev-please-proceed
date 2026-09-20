@@ -1,7 +1,14 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { fileURLToPath } from "node:url";
 import { createFakePluginHost, experimental_scanPublicSdkOnly, makeThreadResponse } from "@get-bb/plugin-sdk/testing";
-import plugin, { buildConversation, buildJevRequest, CONTINUE_THRESHOLD, TYPESAFE_MODEL } from "./server.js";
+import plugin, {
+  askJev,
+  buildConversation,
+  buildJevRequest,
+  CONTINUE_THRESHOLD,
+  JEV_PROVIDERS,
+  resolveJevRoutes,
+} from "./server.js";
 
 type TestEvent = { seq: number; type: string; data: Record<string, unknown> };
 
@@ -46,15 +53,13 @@ function turnRequest(seq: number, requestId: string, text: string, agentOnly = f
   };
 }
 
-function jevResponse(yes: number): Response {
+function jevResponse(noul: number, model: string = JEV_PROVIDERS.typesafe.model): Response {
   return new Response(JSON.stringify({
-    model: TYPESAFE_MODEL,
+    model,
     answers: {
       continue: {
-        type: "choice",
-        choice: yes > 0.5 ? "yes" : "no",
-        probabilities: { yes, no: 1 - yes },
-        confidence: Math.max(yes, 1 - yes),
+        type: "noul",
+        noul,
       },
     },
     usage: { input_tokens: 100, output_tokens: 2 },
@@ -93,16 +98,53 @@ describe("conversation construction", () => {
     ]);
   });
 
-  it("puts the entire conversation in Jev state", () => {
+  it("puts the entire conversation in Jev state as one Noul question", () => {
     const conversation = [
       { role: "user" as const, text: "first" },
       { role: "assistant" as const, text: "second" },
       { role: "user" as const, text: "third" },
     ];
-    const request = buildJevRequest(conversation);
-    expect(JSON.parse(request.state)).toEqual({ conversation });
-    expect(request.questions.continue.criteria).toHaveProperty("yes");
-    expect(request.questions.continue.criteria).toHaveProperty("no");
+    const request = buildJevRequest({ provider: "typesafe", apiKey: "secret" }, conversation);
+    expect(request.state).toEqual({ conversation });
+    expect(request.questions.continue.type).toBe("noul");
+    expect(request.questions.continue.criteria).toHaveProperty("true");
+    expect(request.questions.continue.criteria).toHaveProperty("false");
+  });
+});
+
+describe("Jev routes", () => {
+  it("uses every configured key in a stable auto fallback order", () => {
+    expect(resolveJevRoutes({
+      jevProvider: "auto",
+      typesafeApiKey: " direct ",
+      vercelAiGatewayApiKey: "vercel",
+      openRouterApiKey: "openrouter",
+    })).toEqual([
+      { provider: "typesafe", apiKey: "direct" },
+      { provider: "vercel", apiKey: "vercel" },
+      { provider: "openrouter", apiKey: "openrouter" },
+    ]);
+  });
+
+  it("uses only the selected provider and falls back across routes without retrying one route", async () => {
+    expect(resolveJevRoutes({
+      jevProvider: "openrouter",
+      typesafeApiKey: "direct",
+      openRouterApiKey: "openrouter",
+    })).toEqual([{ provider: "openrouter", apiKey: "openrouter" }]);
+
+    const fetchMock = vi.fn(async (input: string | URL | Request) => {
+      const url = String(input);
+      return url === JEV_PROVIDERS.vercel.endpoint
+        ? new Response("unauthorized", { status: 401 })
+        : jevResponse(0.97, JEV_PROVIDERS.openrouter.model);
+    });
+    const decision = await askJev([
+      { provider: "vercel", apiKey: "bad" },
+      { provider: "openrouter", apiKey: "good" },
+    ], [{ role: "user", text: "continue" }], fetchMock);
+    expect(decision).toEqual({ noul: 0.97, provider: "openrouter" });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 });
 

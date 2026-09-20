@@ -2,18 +2,39 @@ import { createHash } from "node:crypto";
 import type { BbPluginApi } from "@get-bb/plugin-sdk";
 import { z } from "zod";
 
-export const TYPESAFE_ENDPOINT = "https://api.typesafe.ai/v1/systemone";
-export const TYPESAFE_MODEL = "jev-1.13.0";
 export const CONTINUE_THRESHOLD = 0.95;
 export const JEV_TIMEOUT_MS = 5_000;
 const MAX_RESPONSE_BYTES = 32 * 1_024;
 const EVENT_PAGE_SIZE = "500";
 const STATS_KEY = "stats:v1";
 
+export const JEV_PROVIDERS = {
+  typesafe: {
+    name: "TypeSafe",
+    endpoint: "https://api.typesafe.ai/v1/systemone",
+    model: "jev-1.13.0",
+  },
+  vercel: {
+    name: "Vercel AI Gateway",
+    endpoint: "https://ai-gateway.vercel.sh/typesafe/v1/systemone",
+    model: "typesafe-ai/jev",
+  },
+  openrouter: {
+    name: "OpenRouter",
+    endpoint: "https://openrouter.ai/api/alpha/decisions",
+    model: "typesafe/jev-1.13",
+  },
+} as const;
+
+export type JevProvider = keyof typeof JEV_PROVIDERS;
+export type JevProviderMode = "auto" | JevProvider;
+export type JevRoute = { provider: JevProvider; apiKey: string };
+const JEV_PROVIDER_CHOICES: JevProviderMode[] = ["auto", "typesafe", "vercel", "openrouter"];
+
 type ConversationMessage = { role: "user" | "assistant"; text: string };
 type ThreadState = { version: 1; lastIdleKey: string; lastProceedAssistantHash: string | null };
 type Stats = {
-  version: 1;
+  version: 2;
   idleEvents: number;
   jevCalls: number;
   proceeds: number;
@@ -22,26 +43,23 @@ type Stats = {
   races: number;
   errors: number;
   lastDecisionAt: string | null;
-  lastYesProbability: number | null;
+  lastNoul: number | null;
+  lastProvider: JevProvider | null;
 };
 type EventRow = { seq: number; type: string; data: Record<string, unknown> };
 
 const answerSchema = z.object({
-  type: z.literal("choice"),
-  choice: z.enum(["yes", "no"]),
-  probabilities: z.object({ yes: z.number().min(0).max(1), no: z.number().min(0).max(1) }).strict()
-    .refine(({ yes, no }) => Math.abs(yes + no - 1) <= 0.01, "probabilities must sum to one"),
-  confidence: z.number().min(0).max(1),
-}).strict();
+  type: z.literal("noul"),
+  noul: z.number().min(0).max(1),
+}).passthrough();
 
 const responseSchema = z.object({
-  model: z.literal(TYPESAFE_MODEL),
-  answers: z.object({ continue: answerSchema }).strict(),
-  usage: z.object({ input_tokens: z.number().int().nonnegative(), output_tokens: z.number().int().nonnegative() }).strict(),
-}).strict();
+  model: z.string().optional(),
+  answers: z.object({ continue: answerSchema }).passthrough(),
+}).passthrough();
 
 const emptyStats = (): Stats => ({
-  version: 1,
+  version: 2,
   idleEvents: 0,
   jevCalls: 0,
   proceeds: 0,
@@ -50,7 +68,8 @@ const emptyStats = (): Stats => ({
   races: 0,
   errors: 0,
   lastDecisionAt: null,
-  lastYesProbability: null,
+  lastNoul: null,
+  lastProvider: null,
 });
 
 function hash(value: string): string {
@@ -61,6 +80,58 @@ function asRecord(value: unknown): Record<string, unknown> | null {
   return typeof value === "object" && value !== null && !Array.isArray(value)
     ? value as Record<string, unknown>
     : null;
+}
+
+function count(value: unknown): number {
+  return typeof value === "number" && Number.isInteger(value) && value >= 0 ? value : 0;
+}
+
+function readStats(value: unknown): Stats {
+  const record = asRecord(value);
+  if (record === null || (record.version !== 1 && record.version !== 2)) return emptyStats();
+  const provider = record.lastProvider;
+  return {
+    version: 2,
+    idleEvents: count(record.idleEvents),
+    jevCalls: count(record.jevCalls),
+    proceeds: count(record.proceeds),
+    stops: count(record.stops),
+    repeatedStops: count(record.repeatedStops),
+    races: count(record.races),
+    errors: count(record.errors),
+    lastDecisionAt: typeof record.lastDecisionAt === "string" ? record.lastDecisionAt : null,
+    lastNoul: typeof record.lastNoul === "number"
+      ? record.lastNoul
+      : typeof record.lastYesProbability === "number" ? record.lastYesProbability : null,
+    lastProvider: provider === "typesafe" || provider === "vercel" || provider === "openrouter"
+      ? provider
+      : null,
+  };
+}
+
+function secret(value: unknown): string | null {
+  return typeof value === "string" && value.trim() !== "" ? value.trim() : null;
+}
+
+export function resolveJevRoutes(config: {
+  jevProvider?: string;
+  typesafeApiKey?: string;
+  vercelAiGatewayApiKey?: string;
+  openRouterApiKey?: string;
+}): JevRoute[] {
+  const mode: JevProviderMode = JEV_PROVIDER_CHOICES.includes(config.jevProvider as JevProviderMode)
+    ? config.jevProvider as JevProviderMode
+    : "auto";
+  const keys: Record<JevProvider, string | null> = {
+    typesafe: secret(config.typesafeApiKey),
+    vercel: secret(config.vercelAiGatewayApiKey),
+    openrouter: secret(config.openRouterApiKey),
+  };
+  const order: JevProvider[] = mode === "auto" ? ["typesafe", "vercel", "openrouter"] : [mode];
+  return order.flatMap((provider): JevRoute[] => {
+    const apiKey = keys[provider];
+    return apiKey === null ? [] : [{ provider, apiKey }];
+  });
 }
 
 function textFromBlocks(value: unknown, visibleOnly: boolean): string {
@@ -106,17 +177,17 @@ export function buildConversation(events: readonly EventRow[]): ConversationMess
   return conversation;
 }
 
-export function buildJevRequest(conversation: readonly ConversationMessage[]) {
+export function buildJevRequest(route: JevRoute, conversation: readonly ConversationMessage[]) {
   return {
-    model: TYPESAFE_MODEL,
-    state: JSON.stringify({ conversation }),
+    model: JEV_PROVIDERS[route.provider].model,
+    state: { conversation },
     questions: {
       continue: {
-        type: "choice",
-        instructions: "Should the assistant continue immediately because it is unnecessarily waiting for confirmation or has an obvious, already-authorized next step?",
+        type: "noul",
+        instructions: "The assistant should continue immediately because it is unnecessarily waiting for confirmation or has paused before an obvious, already-authorized next step.",
         criteria: {
-          yes: "The assistant is waiting for a rubber stamp or has paused despite a clear next step already authorized by the user. Sending 'please proceed' should make it continue the existing request without adding new authority.",
-          no: "The request is complete, the assistant genuinely needs information, a meaningful choice, permission, credentials, or another user action, or the situation is uncertain.",
+          true: "The assistant is waiting for a rubber stamp or has paused despite a clear next step already authorized by the user. Sending 'please proceed' should make it continue the existing request without adding new authority.",
+          false: "The request is complete, the assistant genuinely needs information, a meaningful choice, permission, credentials, or another user action, or the situation is uncertain.",
         },
       },
     },
@@ -143,24 +214,61 @@ async function boundedJson(response: Response): Promise<unknown> {
   return JSON.parse(Buffer.concat(chunks.map((chunk) => Buffer.from(chunk)), total).toString("utf8"));
 }
 
-export async function askJev(apiKey: string, conversation: readonly ConversationMessage[], fetcher: typeof fetch = globalThis.fetch): Promise<number> {
+function responseError(route: JevRoute, status: number): Error {
+  const name = JEV_PROVIDERS[route.provider].name;
+  if (status === 401 || status === 403) return new Error(`${name} rejected the API key (HTTP ${status})`);
+  if (status === 402) return new Error(`${name} says the account is out of credit (HTTP 402)`);
+  if (status === 429 || status === 529) return new Error(`${name} rate-limited Jev (HTTP ${status})`);
+  return new Error(`${name} request failed (HTTP ${status})`);
+}
+
+async function askJevRoute(
+  route: JevRoute,
+  conversation: readonly ConversationMessage[],
+  signal: AbortSignal,
+  fetcher: typeof fetch,
+): Promise<number> {
+  const response = await fetcher(JEV_PROVIDERS[route.provider].endpoint, {
+    method: "POST",
+    redirect: "error",
+    signal,
+    headers: {
+      Authorization: `Bearer ${route.apiKey}`,
+      "Content-Type": "application/json",
+      ...(route.provider === "openrouter" ? {
+        "HTTP-Referer": "https://github.com/lawrenceluk/bb-plugin-jev-please-proceed",
+        "X-OpenRouter-Title": "Jev, Please Proceed",
+      } : {}),
+    },
+    body: JSON.stringify(buildJevRequest(route, conversation)),
+  });
+  if (!response.ok) {
+    void response.body?.cancel().catch(() => undefined);
+    throw responseError(route, response.status);
+  }
+  return responseSchema.parse(await boundedJson(response)).answers.continue.noul;
+}
+
+export async function askJev(
+  routes: readonly JevRoute[],
+  conversation: readonly ConversationMessage[],
+  fetcher: typeof fetch = globalThis.fetch,
+): Promise<{ noul: number; provider: JevProvider }> {
+  if (routes.length === 0) throw new Error("No Jev API key is configured");
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort("Jev continuation timeout"), JEV_TIMEOUT_MS);
+  let lastError: unknown = new Error("Jev request failed");
   try {
-    const response = await fetcher(TYPESAFE_ENDPOINT, {
-      method: "POST",
-      redirect: "error",
-      signal: controller.signal,
-      headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
-      body: JSON.stringify(buildJevRequest(conversation)),
-    });
-    if (!response.ok) {
-      void response.body?.cancel().catch(() => undefined);
-      throw new Error("TypeSafe request failed");
+    for (const route of routes) {
+      if (controller.signal.aborted) break;
+      try {
+        return { noul: await askJevRoute(route, conversation, controller.signal, fetcher), provider: route.provider };
+      } catch (error) {
+        lastError = error;
+      }
     }
-    return responseSchema.parse(await boundedJson(response)).answers.continue.probabilities.yes;
-  } catch {
-    throw new Error("TypeSafe Jev request failed");
+    if (controller.signal.aborted) throw new Error(`Jev did not answer within ${JEV_TIMEOUT_MS / 1000} seconds`);
+    throw lastError;
   } finally {
     clearTimeout(timeout);
   }
@@ -168,10 +276,34 @@ export async function askJev(apiKey: string, conversation: readonly Conversation
 
 export default async function plugin(bb: BbPluginApi) {
   const settings = bb.settings.define({
-    typesafeApiKey: { type: "string", label: "TypeSafe Jev API key", secret: true },
+    typesafeApiKey: {
+      type: "string",
+      label: "TypeSafe API key",
+      description: "Call Jev directly. Create a key at https://console.typesafe.ai.",
+      secret: true,
+    },
+    vercelAiGatewayApiKey: {
+      type: "string",
+      label: "Vercel AI Gateway API key",
+      description: "Call Jev through Vercel AI Gateway. Create a key in the Vercel dashboard under AI Gateway → API keys.",
+      secret: true,
+    },
+    openRouterApiKey: {
+      type: "string",
+      label: "OpenRouter API key",
+      description: "Call Jev through OpenRouter. Create a key at https://openrouter.ai/keys.",
+      secret: true,
+    },
+    jevProvider: {
+      type: "select",
+      label: "Jev provider",
+      description: "Choose one key, or use auto to try configured keys in this order: TypeSafe, Vercel AI Gateway, then OpenRouter.",
+      options: [...JEV_PROVIDER_CHOICES],
+      default: "auto",
+    },
   });
-  if (!(await settings.get()).typesafeApiKey) {
-    bb.status.needsConfiguration("Set the TypeSafe Jev API key to enable automatic continuation.");
+  if (resolveJevRoutes(await settings.get()).length === 0) {
+    bb.status.needsConfiguration("Set a TypeSafe, Vercel AI Gateway, or OpenRouter API key and reload the plugin.");
   }
 
   const locks = new Map<string, Promise<void>>();
@@ -189,8 +321,7 @@ export default async function plugin(bb: BbPluginApi) {
 
   async function updateStats(patch: (stats: Stats) => void): Promise<void> {
     const run = statsLock.then(async () => {
-      const current = await bb.storage.kv.get<Stats>(STATS_KEY);
-      const stats = current?.version === 1 ? current : emptyStats();
+      const stats = readStats(await bb.storage.kv.get(STATS_KEY));
       patch(stats);
       await bb.storage.kv.set(STATS_KEY, stats);
     });
@@ -247,20 +378,21 @@ export default async function plugin(bb: BbPluginApi) {
       return;
     }
 
-    const { typesafeApiKey } = await settings.get();
-    if (!typesafeApiKey || await hasPendingWork(thread.id)) return;
+    const routes = resolveJevRoutes(await settings.get());
+    if (routes.length === 0 || await hasPendingWork(thread.id)) return;
 
     try {
       const conversation = buildConversation(await readAllConversationEvents(thread.id));
       if (conversation.length === 0) return;
       await updateStats((stats) => { stats.jevCalls += 1; });
-      const yesProbability = await askJev(typesafeApiKey, conversation);
+      const decision = await askJev(routes, conversation);
       const decidedAt = new Date().toISOString();
-      if (yesProbability <= CONTINUE_THRESHOLD) {
+      if (decision.noul <= CONTINUE_THRESHOLD) {
         await updateStats((stats) => {
           stats.stops += 1;
           stats.lastDecisionAt = decidedAt;
-          stats.lastYesProbability = yesProbability;
+          stats.lastNoul = decision.noul;
+          stats.lastProvider = decision.provider;
         });
         return;
       }
@@ -281,7 +413,8 @@ export default async function plugin(bb: BbPluginApi) {
       await updateStats((stats) => {
         stats.proceeds += 1;
         stats.lastDecisionAt = decidedAt;
-        stats.lastYesProbability = yesProbability;
+        stats.lastNoul = decision.noul;
+        stats.lastProvider = decision.provider;
       });
     } catch {
       await updateStats((stats) => { stats.errors += 1; });
@@ -292,18 +425,62 @@ export default async function plugin(bb: BbPluginApi) {
   bb.cli.register({
     name: "jev-please-proceed",
     summary: "Inspect Jev automatic-continuation status",
-    commands: [{ name: "status", summary: "Show aggregate decisions", usage: "bb jev-please-proceed status [--json]" }],
+    commands: [
+      { name: "status", summary: "Show configuration and aggregate decisions", usage: "bb jev-please-proceed status [--json]" },
+      { name: "check", summary: "Test the configured Jev route with synthetic text", usage: "bb jev-please-proceed check [--json]" },
+    ],
     async run(argv) {
       const json = argv.includes("--json");
       const command = argv.find((arg) => arg !== "--json") ?? "status";
-      if (command !== "status") return { exitCode: 1, stderr: "Usage: bb jev-please-proceed status [--json]" };
-      const stats = (await bb.storage.kv.get<Stats>(STATS_KEY)) ?? emptyStats();
-      const configured = Boolean((await settings.get()).typesafeApiKey);
-      const output = { configured, threshold: CONTINUE_THRESHOLD, timeoutMs: JEV_TIMEOUT_MS, stats };
+      if (command !== "status" && command !== "check") {
+        return { exitCode: 1, stderr: "Usage: bb jev-please-proceed <status|check> [--json]" };
+      }
+      const config = await settings.get();
+      const routes = resolveJevRoutes(config);
+      const routeNames = routes.map((route) => JEV_PROVIDERS[route.provider].name);
+      if (command === "check") {
+        if (routes.length === 0) return { exitCode: 1, stderr: "No Jev API key is configured." };
+        try {
+          const decision = await askJev(routes, [
+            { role: "user", text: "You are fully authorized to continue. Run the tests now and do not ask me for confirmation." },
+            { role: "assistant", text: "I am pausing solely to ask for the confirmation you told me not to request. Please confirm that I should run the tests." },
+          ]);
+          const output = {
+            ok: true,
+            provider: decision.provider,
+            providerName: JEV_PROVIDERS[decision.provider].name,
+            noul: decision.noul,
+            threshold: CONTINUE_THRESHOLD,
+            wouldProceed: decision.noul > CONTINUE_THRESHOLD,
+          };
+          return {
+            exitCode: 0,
+            stdout: json ? JSON.stringify(output) : [
+              `Provider: ${output.providerName}`,
+              `Noul: ${output.noul}`,
+              `Would proceed: ${output.wouldProceed ? "yes" : "no"}`,
+            ].join("\n"),
+          };
+        } catch (error) {
+          const message = error instanceof Error ? error.message : "Jev check failed";
+          return { exitCode: 1, stderr: json ? JSON.stringify({ ok: false, error: message }) : message };
+        }
+      }
+      const stats = readStats(await bb.storage.kv.get(STATS_KEY));
+      const output = {
+        configured: routes.length > 0,
+        providerMode: config.jevProvider,
+        providers: routes.map((route) => route.provider),
+        threshold: CONTINUE_THRESHOLD,
+        timeoutMs: JEV_TIMEOUT_MS,
+        stats,
+      };
       return {
         exitCode: 0,
         stdout: json ? JSON.stringify(output) : [
-          `Configured: ${configured ? "yes" : "no"}`,
+          `Configured: ${output.configured ? "yes" : "no"}`,
+          `Provider mode: ${output.providerMode}`,
+          `Routes: ${routeNames.length > 0 ? routeNames.join(" → ") : "none"}`,
           `Threshold: > ${CONTINUE_THRESHOLD}`,
           `Idle events: ${stats.idleEvents}`,
           `Jev calls: ${stats.jevCalls}`,
@@ -312,6 +489,8 @@ export default async function plugin(bb: BbPluginApi) {
           `Repeated-stop blocks: ${stats.repeatedStops}`,
           `Race blocks: ${stats.races}`,
           `Errors: ${stats.errors}`,
+          `Last route: ${stats.lastProvider === null ? "none" : JEV_PROVIDERS[stats.lastProvider].name}`,
+          `Last Noul: ${stats.lastNoul === null ? "none" : stats.lastNoul}`,
         ].join("\n"),
       };
     },

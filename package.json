@@ -1,6 +1,6 @@
 {
   "name": "bb-plugin-jev-please-proceed",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Keeps BB agents working when they pause only for an unnecessary rubber stamp.",
   "license": "MIT",
   "repository": {
@@ -20,7 +20,7 @@
     "name": "Jev, Please Proceed",
     "description": "Keeps agents working when they pause only for an unnecessary rubber stamp.",
     "branding": {
-      "icon": "Zap"
+      "icon": "./icons/fast-forward.svg"
     },
     "server": "./server.ts"
   },
